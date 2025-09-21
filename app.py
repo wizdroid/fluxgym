@@ -1,3 +1,15 @@
+"""
+FluxGym - FLUX LoRA Training Application
+
+This application automatically scans the local models/ directory structure
+to provide dropdowns for model selection instead of using a models.yaml configuration file.
+
+Directory structure expected:
+- models/unet/     - Main FLUX model files (.safetensors, .sft)
+- models/clip/     - CLIP and T5 text encoder files (.safetensors)
+- models/vae/      - VAE encoder/decoder files (.safetensors, .sft)
+"""
+
 import os
 import sys
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
@@ -12,9 +24,11 @@ import uuid
 import shutil
 import json
 import yaml
+import requests
+import base64
+from io import BytesIO
 from slugify import slugify
 from transformers import AutoProcessor, AutoModelForCausalLM
-from gradio_logsview import LogsView, LogsViewRunner
 from huggingface_hub import hf_hub_download, HfApi
 from library import flux_train_utils, huggingface_util
 from argparse import Namespace
@@ -23,27 +37,250 @@ import toml
 import re
 MAX_IMAGES = 150
 
-with open('models.yaml', 'r') as file:
-    models = yaml.safe_load(file)
+def detect_gpu_info():
+    """Detect GPU information including name, VRAM, and capabilities"""
+    gpu_info = {
+        'name': 'Unknown',
+        'vram_gb': 8,  # Default fallback
+        'compute_capability': None,
+        'driver_version': None,
+        'cuda_available': False,
+        'recommended_settings': {}
+    }
+    
+    try:
+        if torch.cuda.is_available():
+            gpu_info['cuda_available'] = True
+            gpu_info['name'] = torch.cuda.get_device_name(0)
+            
+            # Get VRAM information
+            vram_bytes = torch.cuda.get_device_properties(0).total_memory
+            gpu_info['vram_gb'] = round(vram_bytes / (1024**3))
+            
+            # Get compute capability
+            major, minor = torch.cuda.get_device_capability(0)
+            gpu_info['compute_capability'] = f"{major}.{minor}"
+            
+            # Try to get CUDA version
+            try:
+                gpu_info['driver_version'] = torch.version.cuda
+            except:
+                try:
+                    gpu_info['driver_version'] = torch.cuda.get_device_name(0)
+                except:
+                    pass
+                
+        else:
+            # CPU fallback
+            gpu_info['name'] = 'CPU (No CUDA GPU detected)'
+            gpu_info['vram_gb'] = 8  # Assume 8GB RAM for CPU
+            
+    except Exception as e:
+        print(f"Error detecting GPU: {e}")
+    
+    return gpu_info
 
-def readme(base_model, lora_name, instance_prompt, sample_prompts):
+def get_optimal_settings(gpu_info):
+    """Generate optimal training settings based on GPU specifications"""
+    vram_gb = gpu_info['vram_gb']
+    gpu_name = gpu_info['name'].lower()
+    
+    # Base settings
+    settings = {
+        'vram_setting': '20G',
+        'batch_size': 1,
+        'network_dim': 16,
+        'learning_rate': '8e-4',
+        'max_train_epochs': 16,
+        'save_every_n_epochs': 4,
+        'resolution': 512,
+        'workers': 2,
+        'gradient_accumulation': 1,
+        'mixed_precision': 'bf16',
+        'optimizer': 'adamw8bit',
+        'use_8bit_adam': True,
+        'fp8_base': True,
+        'cache_latents': True,
+        'cache_text_encoder_outputs': True
+    }
+    
+    # VRAM-based optimizations
+    if vram_gb >= 24:
+        # RTX 4090, RTX 6000 Ada, etc.
+        settings.update({
+            'vram_setting': '20G',
+            'batch_size': 1,
+            'network_dim': 32,
+            'learning_rate': '1e-4',
+            'workers': 4,
+            'gradient_accumulation': 1,
+            'optimizer': 'adamw8bit',
+            'resolution': 1024
+        })
+    elif vram_gb >= 16:
+        # RTX 4080, RTX 3090, etc.
+        settings.update({
+            'vram_setting': '16G',
+            'batch_size': 1,
+            'network_dim': 16,
+            'learning_rate': '8e-4',
+            'workers': 3,
+            'gradient_accumulation': 1,
+            'optimizer': 'adafactor',
+            'resolution': 768
+        })
+    elif vram_gb >= 12:
+        # RTX 4070 Ti, RTX 3080, etc.
+        settings.update({
+            'vram_setting': '12G',
+            'batch_size': 1,
+            'network_dim': 8,
+            'learning_rate': '1e-3',
+            'workers': 2,
+            'gradient_accumulation': 2,
+            'optimizer': 'adafactor',
+            'resolution': 512
+        })
+    elif vram_gb >= 8:
+        # RTX 4060 Ti, RTX 3070, etc.
+        settings.update({
+            'vram_setting': '12G',  # Use 12G settings but with lower params
+            'batch_size': 1,
+            'network_dim': 4,
+            'learning_rate': '1e-3',
+            'workers': 1,
+            'gradient_accumulation': 4,
+            'optimizer': 'adafactor',
+            'resolution': 512
+        })
+    else:
+        # Lower VRAM cards
+        settings.update({
+            'vram_setting': '12G',
+            'batch_size': 1,
+            'network_dim': 4,
+            'learning_rate': '1e-3',
+            'workers': 1,
+            'gradient_accumulation': 8,
+            'optimizer': 'adafactor',
+            'resolution': 512
+        })
+    
+    # GPU-specific optimizations
+    if 'rtx 40' in gpu_name or 'rtx 50' in gpu_name:
+        # Ada Lovelace architecture optimizations
+        settings['mixed_precision'] = 'bf16'
+        settings['fp8_base'] = True
+    elif 'rtx 30' in gpu_name:
+        # Ampere architecture optimizations
+        settings['mixed_precision'] = 'bf16'
+        settings['fp8_base'] = True
+    elif 'rtx 20' in gpu_name or 'gtx' in gpu_name:
+        # Turing/Pascal architecture
+        settings['mixed_precision'] = 'fp16'
+        settings['fp8_base'] = False
+    elif 'tesla' in gpu_name or 'quadro' in gpu_name:
+        # Professional cards
+        settings['mixed_precision'] = 'bf16'
+        settings['fp8_base'] = True
+        settings['workers'] = min(settings['workers'], 2)  # More conservative
+    
+    # Compute capability optimizations
+    if gpu_info.get('compute_capability'):
+        cc_major = int(gpu_info['compute_capability'].split('.')[0])
+        if cc_major >= 8:  # RTX 30 series and newer
+            settings['fp8_base'] = True
+        elif cc_major >= 7:  # RTX 20 series
+            settings['fp8_base'] = True
+        else:  # Older cards
+            settings['fp8_base'] = False
+            settings['mixed_precision'] = 'fp16'
+    
+    return settings
 
-    # model license
-    model_config = models[base_model]
-    model_file = model_config["file"]
-    base_model_name = model_config["base"]
-    license = None
-    license_name = None
-    license_link = None
+def format_gpu_info_display(gpu_info, optimal_settings):
+    """Format GPU information for display in the UI"""
+    if gpu_info['cuda_available']:
+        info_text = f"""**🎮 GPU Detected:** {gpu_info['name']}
+**💾 VRAM:** {gpu_info['vram_gb']} GB
+**🔧 Compute Capability:** {gpu_info.get('compute_capability', 'Unknown')}
+**⚡ Recommended VRAM Setting:** {optimal_settings['vram_setting']}
+**📐 Recommended Resolution:** {optimal_settings['resolution']}px
+**🧠 Recommended LoRA Rank:** {optimal_settings['network_dim']}"""
+    else:
+        info_text = """**⚠️ No CUDA GPU detected**
+Training will use CPU (very slow)
+Consider using a CUDA-compatible GPU for faster training"""
+    
+    return info_text
+
+def get_available_models():
+    """Scan models directories and return available files for each type"""
+    models_base = resolve_path_without_quotes("models")
+    
+    # Get CLIP files
+    clip_dir = os.path.join(models_base, "clip")
+    clip_files = []
+    if os.path.exists(clip_dir):
+        for file in os.listdir(clip_dir):
+            if file.endswith('.safetensors'):
+                clip_files.append(file)
+    clip_files.sort()
+    
+    # Get T5 files (also in clip directory)
+    t5_files = []
+    if os.path.exists(clip_dir):
+        for file in os.listdir(clip_dir):
+            if file.endswith('.safetensors') and ('t5' in file.lower() or 'qwen' in file.lower()):
+                t5_files.append(file)
+    t5_files.sort()
+    
+    # Get UNET files
+    unet_dir = os.path.join(models_base, "unet")
+    unet_files = []
+    if os.path.exists(unet_dir):
+        for file in os.listdir(unet_dir):
+            if file.endswith('.safetensors') or file.endswith('.sft'):
+                unet_files.append(file)
+    unet_files.sort()
+    
+    # Get VAE files
+    vae_dir = os.path.join(models_base, "vae")
+    vae_files = []
+    if os.path.exists(vae_dir):
+        for file in os.listdir(vae_dir):
+            if file.endswith('.safetensors') or file.endswith('.sft'):
+                vae_files.append(file)
+    vae_files.sort()
+    
+    return {
+        'clip': clip_files,
+        't5': t5_files,
+        'unet': unet_files,
+        'vae': vae_files
+    }
+
+def readme(unet_file, lora_name, instance_prompt, sample_prompts):
+
+    # Determine base model and license info from UNET filename
+    if "schnell" in unet_file.lower():
+        base_model_name = "black-forest-labs/FLUX.1-schnell"
+        license = "apache-2.0"
+        license_name = None
+        license_link = None
+    else:
+        # Default to FLUX.1-dev
+        base_model_name = "black-forest-labs/FLUX.1-dev"
+        license = "other"
+        license_name = "flux-1-dev-non-commercial-license"
+        license_link = "https://huggingface.co/black-forest-labs/FLUX.1-dev/blob/main/LICENSE.md"
+    
     license_items = []
-    if "license" in model_config:
-        license = model_config["license"]
+    if license:
         license_items.append(f"license: {license}")
-    if "license_name" in model_config:
-        license_name = model_config["license_name"]
+    if license_name:
         license_items.append(f"license_name: {license_name}")
-    if "license_link" in model_config:
-        license_link = model_config["license_link"]
+    if license_link:
         license_items.append(f"license_link: {license_link}")
     license_str = "\n".join(license_items)
     print(f"license_items={license_items}")
@@ -111,6 +348,162 @@ Weights for this model are available in Safetensors format.
 """
     return readme_content
 
+def refresh_models():
+    """Refresh the available models from the models directory"""
+    available_models = get_available_models()
+    return (
+        gr.update(choices=available_models['unet'], value=available_models['unet'][0] if available_models['unet'] else None),
+        gr.update(choices=available_models['vae'], value=available_models['vae'][0] if available_models['vae'] else None),
+        gr.update(choices=available_models['clip'], value=available_models['clip'][0] if available_models['clip'] else None),
+        gr.update(choices=available_models['t5'], value=available_models['t5'][0] if available_models['t5'] else None)
+    )
+
+def check_ollama_connection(base_url="http://localhost:11434"):
+    """Check if Ollama is running and accessible"""
+    try:
+        response = requests.get(f"{base_url}/api/tags", timeout=5)
+        return response.status_code == 200
+    except:
+        return False
+
+def get_ollama_models(base_url="http://localhost:11434"):
+    """Get list of available Ollama models with enhanced filtering"""
+    try:
+        response = requests.get(f"{base_url}/api/tags", timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            models = [model["name"] for model in data.get("models", [])]
+
+            if not models:
+                return []
+
+            # Enhanced filtering for vision-capable models
+            vision_keywords = [
+                'llava', 'vision', 'minicpm', 'cogvlm', 'qwen-vl', 'internvl', 'moondream',
+                'llama-vision', 'bakllava', 'llava-phi', 'llava-qwen', 'llava-llama',
+                'gpt4v', 'claude-vision', 'gemini-vision', 'visual', 'image', 'caption'
+            ]
+
+            # First pass: strict vision model filtering
+            vision_models = [m for m in models if any(keyword in m.lower() for keyword in vision_keywords)]
+
+            # Second pass: if no vision models found, include models that might have vision capabilities
+            if not vision_models:
+                # Include models with common vision-related names or recent multimodal models
+                potential_vision = [
+                    m for m in models if any(keyword in m.lower() for keyword in
+                    ['llama', 'qwen', 'mistral', 'gemma', 'phi', 'gemma2', 'mixtral', 'yi'])
+                ]
+                vision_models = potential_vision if potential_vision else models
+
+            # Sort models alphabetically for better UX
+            vision_models.sort()
+
+            return vision_models
+        return []
+    except requests.exceptions.RequestException as e:
+        print(f"Network error connecting to Ollama: {e}")
+        return []
+    except Exception as e:
+        print(f"Error fetching Ollama models: {e}")
+        return []
+
+def encode_image_to_base64(image_path):
+    """Convert image to base64 for Ollama API"""
+    with Image.open(image_path) as img:
+        # Resize if too large to avoid API limits
+        if img.width > 1024 or img.height > 1024:
+            img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+        
+        buffer = BytesIO()
+        img.save(buffer, format="JPEG", quality=85)
+        img_bytes = buffer.getvalue()
+        return base64.b64encode(img_bytes).decode('utf-8')
+
+def caption_with_ollama(image_path, model_name, prompt, base_url="http://localhost:11434"):
+    """Generate caption using Ollama vision model"""
+    try:
+        image_b64 = encode_image_to_base64(image_path)
+        
+        payload = {
+            "model": model_name,
+            "prompt": prompt,
+            "images": [image_b64],
+            "stream": False
+        }
+        
+        response = requests.post(f"{base_url}/api/generate", json=payload, timeout=60)
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("response", "").strip()
+        else:
+            return f"Error: HTTP {response.status_code}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+def refresh_ollama_models(ollama_url):
+    """Refresh available Ollama models with better error handling"""
+    try:
+        models = get_ollama_models(ollama_url)
+        if not models:
+            gr.Warning("No Ollama models found. Make sure Ollama is running and has vision-capable models installed.")
+            return gr.update(choices=[], value=None)
+
+        # Select the first model as default
+        default_model = models[0] if models else None
+
+        gr.Info(f"Successfully loaded {len(models)} Ollama models")
+        return gr.update(choices=models, value=default_model)
+
+    except Exception as e:
+        gr.Error(f"Failed to refresh Ollama models: {str(e)}")
+        return gr.update(choices=[], value=None)
+
+def auto_load_ollama_models():
+    """Automatically load Ollama models on app startup if Ollama is available"""
+    try:
+        if check_ollama_connection():
+            models = get_ollama_models()
+            if models:
+                print(f"✅ Auto-loaded {len(models)} Ollama models: {', '.join(models[:3])}{'...' if len(models) > 3 else ''}")
+                return models, models[0] if models else None
+        return [], None
+    except Exception as e:
+        print(f"⚠️  Could not auto-load Ollama models: {e}")
+        return [], None
+
+def toggle_captioning_method(method):
+    """Toggle between Florence-2 and Ollama captioning options"""
+    if method == "Ollama":
+        # Auto-refresh Ollama models when switching to Ollama
+        try:
+            models = get_ollama_models()
+            default_model = models[0] if models else None
+            return gr.update(visible=True), gr.update(choices=models, value=default_model)
+        except Exception as e:
+            print(f"⚠️ Could not load Ollama models: {e}")
+            return gr.update(visible=True), gr.update(choices=[], value=None)
+    else:
+        return gr.update(visible=False), gr.update(choices=[], value=None)
+
+def auto_configure_settings():
+    """Auto-configure settings based on detected GPU"""
+    gpu_info = detect_gpu_info()
+    optimal_settings = get_optimal_settings(gpu_info)
+    gpu_display = format_gpu_info_display(gpu_info, optimal_settings)
+    
+    return (
+        gpu_display,
+        optimal_settings['vram_setting'],
+        optimal_settings['resolution'],
+        optimal_settings['network_dim'],
+        optimal_settings['learning_rate'],
+        optimal_settings['max_train_epochs'],
+        optimal_settings['save_every_n_epochs'],
+        optimal_settings['workers']
+    )
+
 def account_hf():
     try:
         with open("HF_TOKEN", "r") as file:
@@ -154,10 +547,10 @@ def login_hf(hf_token):
         print(f"incorrect hf_token")
         return gr.update(), gr.update(), gr.update(), gr.update()
 
-def upload_hf(base_model, lora_rows, repo_owner, repo_name, repo_visibility, hf_token):
+def upload_hf(unet_file, lora_rows, repo_owner, repo_name, repo_visibility, hf_token):
     src = lora_rows
     repo_id = f"{repo_owner}/{repo_name}"
-    gr.Info(f"Uploading to Huggingface. Please Stand by...", duration=None)
+    gr.Info(f"Uploading to Huggingface. Please Stand by...")
     args = Namespace(
         huggingface_repo_id=repo_id,
         huggingface_repo_type="model",
@@ -168,7 +561,7 @@ def upload_hf(base_model, lora_rows, repo_owner, repo_name, repo_visibility, hf_
     )
     print(f"upload_hf args={args}")
     huggingface_util.upload(args=args, src=src)
-    gr.Info(f"[Upload Complete] https://huggingface.co/{repo_id}", duration=None)
+    gr.Info(f"[Upload Complete] https://huggingface.co/{repo_id}")
 
 def load_captioning(uploaded_files, concept_sentence):
     uploaded_images = [file for file in uploaded_files if not file.endswith('.txt')]
@@ -181,10 +574,16 @@ def load_captioning(uploaded_files, concept_sentence):
         )
     elif len(uploaded_images) > MAX_IMAGES:
         raise gr.Error(f"For now, only {MAX_IMAGES} or less images are allowed for training")
+    
     # Update for the captioning_area
-    # for _ in range(3):
     updates.append(gr.update(visible=True))
-    # Update visibility and image for each captioning row and image
+
+    # Auto-load Ollama models if available
+    ollama_models, default_model = auto_load_ollama_models()
+    updates.append(gr.update(visible=False))  # ollama_settings initially hidden
+    
+    # Update Ollama model dropdown with loaded models
+    updates.append(gr.update(choices=ollama_models, value=default_model))    # Update visibility and image for each captioning row and image
     for i in range(1, MAX_IMAGES + 1):
         # Determine if the current row and image should be visible
         visible = i <= len(uploaded_images)
@@ -267,52 +666,165 @@ def create_dataset(destination_folder, size, *inputs):
     return destination_folder
 
 
-def run_captioning(images, concept_sentence, *captions):
-    print(f"run_captioning")
-    print(f"concept sentence {concept_sentence}")
-    print(f"captions {captions}")
-    #Load internally to not consume resources for training
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"device={device}")
-    torch_dtype = torch.float16
-    model = AutoModelForCausalLM.from_pretrained(
-        "multimodalart/Florence-2-large-no-flash-attn", torch_dtype=torch_dtype, trust_remote_code=True
-    ).to(device)
-    processor = AutoProcessor.from_pretrained("multimodalart/Florence-2-large-no-flash-attn", trust_remote_code=True)
-
+def run_captioning(images, concept_sentence, captioning_method, ollama_model, ollama_url, *captions):
+    print(f"run_captioning: method={captioning_method}")
+    print(f"concept sentence: {concept_sentence}")
+    print(f"captions: {captions}")
+    
     captions = list(captions)
-    for i, image_path in enumerate(images):
-        print(captions[i])
-        if isinstance(image_path, str):  # If image is a file path
-            image = Image.open(image_path).convert("RGB")
+    
+    if captioning_method == "Ollama":
+        # Use Ollama for captioning
+        if not check_ollama_connection(ollama_url):
+            gr.Error(f"Cannot connect to Ollama at {ollama_url}. Please ensure Ollama is running.")
+            return captions
+        
+        if not ollama_model:
+            gr.Error("Please select an Ollama model for captioning.")
+            return captions
+        
+        ollama_prompt = "Describe this image in detail, focusing on the visual elements, composition, style, and any notable features. Be descriptive but concise."
+        
+        for i, image_path in enumerate(images):
+            print(f"Processing image {i+1}/{len(images)} with Ollama")
+            if isinstance(image_path, str):
+                try:
+                    caption_text = caption_with_ollama(image_path, ollama_model, ollama_prompt, ollama_url)
+                    
+                    if caption_text.startswith("Error:"):
+                        gr.Warning(f"Failed to caption image {i+1}: {caption_text}")
+                        continue
+                    
+                    # Add concept sentence if provided
+                    if concept_sentence:
+                        caption_text = f"{concept_sentence} {caption_text}"
+                    
+                    captions[i] = caption_text
+                    yield captions
+                    
+                except Exception as e:
+                    gr.Warning(f"Error processing image {i+1}: {str(e)}")
+                    continue
+    
+    else:
+        # Use Florence-2 (robust with fallbacks)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"device={device}")
+        torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
-        prompt = "<DETAILED_CAPTION>"
-        inputs = processor(text=prompt, images=image, return_tensors="pt").to(device, torch_dtype)
-        print(f"inputs {inputs}")
+        florence_repo = "multimodalart/Florence-2-large-no-flash-attn"
+        model = None
+        processor = None
 
-        generated_ids = model.generate(
-            input_ids=inputs["input_ids"], pixel_values=inputs["pixel_values"], max_new_tokens=1024, num_beams=3
-        )
-        print(f"generated_ids {generated_ids}")
+        def unload():
+            try:
+                if model is not None:
+                    model.to("cpu")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
-        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-        print(f"generated_text: {generated_text}")
-        parsed_answer = processor.post_process_generation(
-            generated_text, task=prompt, image_size=(image.width, image.height)
-        )
-        print(f"parsed_answer = {parsed_answer}")
-        caption_text = parsed_answer["<DETAILED_CAPTION>"].replace("The image shows ", "")
-        print(f"caption_text = {caption_text}, concept_sentence={concept_sentence}")
-        if concept_sentence:
-            caption_text = f"{concept_sentence} {caption_text}"
-        captions[i] = caption_text
+        # Load processor first (cheaper) so we can still fallback
+        try:
+            processor = AutoProcessor.from_pretrained(florence_repo, trust_remote_code=True)
+        except Exception as e:
+            gr.Warning(f"Processor load failed: {e}. Falling back to simple heuristic captions.")
+        
+        # Try progressive model loading strategies
+        load_attempt_errors = []
+        if processor is not None:
+            load_strategies = [
+                dict(attn_implementation="eager"),
+                dict(),  # default
+            ]
+            for strat in load_strategies:
+                if model is not None:
+                    break
+                try:
+                    model = AutoModelForCausalLM.from_pretrained(
+                        florence_repo,
+                        torch_dtype=torch_dtype,
+                        trust_remote_code=True,
+                        **strat,
+                    )
+                    model.to(device)
+                except Exception as ex:
+                    load_attempt_errors.append(str(ex))
+                    model = None
 
-        yield captions
-    model.to("cpu")
-    del model
-    del processor
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        if model is None or processor is None:
+            # Final fallback: simple heuristic captioning
+            for i, image_path in enumerate(images):
+                try:
+                    base_caption = "a training reference image"
+                    if isinstance(image_path, str):
+                        with Image.open(image_path) as im:
+                            w, h = im.size
+                            base_caption = f"an image ({w}x{h}) with subject" if w and h else base_caption
+                    if concept_sentence:
+                        base_caption = f"{concept_sentence} {base_caption}"
+                    captions[i] = base_caption
+                except Exception as fe:
+                    captions[i] = concept_sentence or "image"
+                yield captions
+            gr.Warning("Florence model unavailable. Used heuristic fallback captions. Errors: " + "; ".join(load_attempt_errors[-2:]))
+            unload()
+            return
+
+        # Inference loop
+        prompt_token = "<DETAILED_CAPTION>"
+        for i, image_path in enumerate(images):
+            print(f"Processing image {i+1}/{len(images)} with Florence-2 (robust)")
+            if isinstance(image_path, str):
+                try:
+                    image = Image.open(image_path).convert("RGB")
+                except Exception as ie:
+                    gr.Warning(f"Failed to open image {image_path}: {ie}")
+                    captions[i] = concept_sentence or "image"
+                    yield captions
+                    continue
+            else:
+                # Unsupported type
+                captions[i] = concept_sentence or "image"
+                yield captions
+                continue
+
+            try:
+                inputs = processor(text=prompt_token, images=image, return_tensors="pt").to(device, torch_dtype)
+                # Some Florence variants might not expose generate; fallback to language_model.generate or manual forward
+                generate_fn = None
+                if hasattr(model, "generate"):
+                    generate_fn = model.generate
+                elif hasattr(getattr(model, "language_model", None), "generate"):
+                    generate_fn = model.language_model.generate  # type: ignore
+
+                if generate_fn is None:
+                    raise AttributeError("No generate method available on Florence model")
+
+                generated_ids = generate_fn(
+                    input_ids=inputs.get("input_ids"),
+                    pixel_values=inputs.get("pixel_values"),
+                    max_new_tokens=256,
+                    num_beams=3,
+                )
+                decoded = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+                parsed = processor.post_process_generation(
+                    decoded, task=prompt_token, image_size=(image.width, image.height)
+                )
+                caption_text = parsed.get(prompt_token, "").replace("The image shows ", "").strip()
+                if not caption_text:
+                    caption_text = "a detailed image"
+            except Exception as gen_ex:
+                gr.Warning(f"Caption generation failed (fallback applied): {gen_ex}")
+                caption_text = "a training image"
+
+            if concept_sentence:
+                caption_text = f"{concept_sentence} {caption_text}".strip()
+            captions[i] = caption_text
+            yield captions
+
+        unload()
 
 def recursive_update(d, u):
     for k, v in u.items():
@@ -321,49 +833,6 @@ def recursive_update(d, u):
         else:
             d[k] = v
     return d
-
-def download(base_model):
-    model = models[base_model]
-    model_file = model["file"]
-    repo = model["repo"]
-
-    # download unet
-    if base_model == "flux-dev" or base_model == "flux-schnell":
-        unet_folder = "models/unet"
-    else:
-        unet_folder = f"models/unet/{repo}"
-    unet_path = os.path.join(unet_folder, model_file)
-    if not os.path.exists(unet_path):
-        os.makedirs(unet_folder, exist_ok=True)
-        gr.Info(f"Downloading base model: {base_model}. Please wait. (You can check the terminal for the download progress)", duration=None)
-        print(f"download {base_model}")
-        hf_hub_download(repo_id=repo, local_dir=unet_folder, filename=model_file)
-
-    # download vae
-    vae_folder = "models/vae"
-    vae_path = os.path.join(vae_folder, "ae.sft")
-    if not os.path.exists(vae_path):
-        os.makedirs(vae_folder, exist_ok=True)
-        gr.Info(f"Downloading vae")
-        print(f"downloading ae.sft...")
-        hf_hub_download(repo_id="cocktailpeanut/xulf-dev", local_dir=vae_folder, filename="ae.sft")
-
-    # download clip
-    clip_folder = "models/clip"
-    clip_l_path = os.path.join(clip_folder, "clip_l.safetensors")
-    if not os.path.exists(clip_l_path):
-        os.makedirs(clip_folder, exist_ok=True)
-        gr.Info(f"Downloading clip...")
-        print(f"download clip_l.safetensors")
-        hf_hub_download(repo_id="comfyanonymous/flux_text_encoders", local_dir=clip_folder, filename="clip_l.safetensors")
-
-    # download t5xxl
-    t5xxl_path = os.path.join(clip_folder, "t5xxl_fp16.safetensors")
-    if not os.path.exists(t5xxl_path):
-        print(f"download t5xxl_fp16.safetensors")
-        gr.Info(f"Downloading t5xxl...")
-        hf_hub_download(repo_id="comfyanonymous/flux_text_encoders", local_dir=clip_folder, filename="t5xxl_fp16.safetensors")
-
 
 def resolve_path(p):
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -375,7 +844,10 @@ def resolve_path_without_quotes(p):
     return norm_path
 
 def gen_sh(
-    base_model,
+    unet_file,
+    clip_file,
+    t5_file,
+    vae_file,
     output_name,
     resolution,
     seed,
@@ -389,6 +861,17 @@ def gen_sh(
     vram,
     sample_prompts,
     sample_every_n_steps,
+    lr_scheduler,
+    max_train_steps,
+    train_batch_size,
+    reg_data_dir,
+    cache_latents,
+    cache_latents_to_disk,
+    cache_text_encoder_outputs,
+    cache_text_encoder_outputs_to_disk,
+    skip_cache_check,
+    vae_batch_size,
+    cache_info,
     *advanced_components
 ):
 
@@ -437,19 +920,12 @@ def gen_sh(
 
 
     #######################################################
-    model_config = models[base_model]
-    model_file = model_config["file"]
-    repo = model_config["repo"]
-    if base_model == "flux-dev" or base_model == "flux-schnell":
-        model_folder = "models/unet"
-    else:
-        model_folder = f"models/unet/{repo}"
-    model_path = os.path.join(model_folder, model_file)
-    pretrained_model_path = resolve_path(model_path)
-
-    clip_path = resolve_path("models/clip/clip_l.safetensors")
-    t5_path = resolve_path("models/clip/t5xxl_fp16.safetensors")
-    ae_path = resolve_path("models/vae/ae.sft")
+    # Build paths from selected files
+    pretrained_model_path = resolve_path(f"models/unet/{unet_file}")
+    clip_path = resolve_path(f"models/clip/{clip_file}")
+    t5_path = resolve_path(f"models/clip/{t5_file}")
+    ae_path = resolve_path(f"models/vae/{vae_file}")
+    
     sh = f"""accelerate launch {line_break}
   --mixed_precision bf16 {line_break}
   --num_cpu_threads_per_process 1 {line_break}
@@ -485,6 +961,41 @@ def gen_sh(
   --guidance_scale {guidance_scale} {line_break}
   --loss_type l2 {line_break}"""
    
+    # Add new training parameters
+    if lr_scheduler and lr_scheduler != "constant":
+        sh += f"  --lr_scheduler {lr_scheduler} {line_break}"
+    
+    if max_train_steps is not None and max_train_steps > 0:
+        sh += f"  --max_train_steps {max_train_steps} {line_break}"
+    
+    if train_batch_size and train_batch_size != 1:
+        sh += f"  --train_batch_size {train_batch_size} {line_break}"
+    
+    if reg_data_dir and reg_data_dir.strip():
+        reg_data_path = resolve_path(reg_data_dir.strip())
+        sh += f"  --reg_data_dir {reg_data_path} {line_break}"
+
+    # Add caching options
+    if cache_latents:
+        sh += f"  --cache_latents {line_break}"
+    
+    if cache_latents_to_disk:
+        sh += f"  --cache_latents_to_disk {line_break}"
+    
+    if cache_text_encoder_outputs:
+        sh += f"  --cache_text_encoder_outputs {line_break}"
+    
+    if cache_text_encoder_outputs_to_disk:
+        sh += f"  --cache_text_encoder_outputs_to_disk {line_break}"
+    
+    if skip_cache_check:
+        sh += f"  --skip_cache_check {line_break}"
+    
+    if vae_batch_size and vae_batch_size != 1:
+        sh += f"  --vae_batch_size {vae_batch_size} {line_break}"
+    
+    if cache_info:
+        sh += f"  --cache_info {line_break}"
 
 
     ############# Advanced args ########################
@@ -567,7 +1078,10 @@ def get_samples(lora_name):
         return []
 
 def start_training(
-    base_model,
+    unet_file,
+    clip_file,
+    t5_file,
+    vae_file,
     lora_name,
     train_script,
     train_config,
@@ -583,7 +1097,26 @@ def start_training(
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
-    download(base_model)
+    # Verify that selected model files exist
+    models_base = resolve_path_without_quotes("models")
+    unet_path = os.path.join(models_base, "unet", unet_file)
+    clip_path = os.path.join(models_base, "clip", clip_file)
+    t5_path = os.path.join(models_base, "clip", t5_file)
+    vae_path = os.path.join(models_base, "vae", vae_file)
+    
+    missing_files = []
+    if not os.path.exists(unet_path):
+        missing_files.append(f"UNET: {unet_file}")
+    if not os.path.exists(clip_path):
+        missing_files.append(f"CLIP: {clip_file}")
+    if not os.path.exists(t5_path):
+        missing_files.append(f"T5: {t5_file}")
+    if not os.path.exists(vae_path):
+        missing_files.append(f"VAE: {vae_file}")
+    
+    if missing_files:
+        gr.Error(f"Missing model files: {', '.join(missing_files)}")
+        return
 
     file_type = "sh"
     if sys.platform == "win32":
@@ -612,15 +1145,48 @@ def start_training(
     else:
         command = f"bash \"{sh_filepath}\""
 
-    # Use Popen to run the command and capture output in real-time
+    # Use subprocess to run the command and capture output
     env = os.environ.copy()
     env['PYTHONIOENCODING'] = 'utf-8'
     env['LOG_LEVEL'] = 'DEBUG'
-    runner = LogsViewRunner()
     cwd = os.path.dirname(os.path.abspath(__file__))
     gr.Info(f"Started training")
-    yield from runner.run_command([command], cwd=cwd)
-    yield runner.log(f"Runner: {runner}")
+    
+    try:
+        # Run the training command
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            cwd=cwd,
+            bufsize=1,
+            universal_newlines=True
+        )
+        
+        output_lines = []
+        while True:
+            output = process.stdout.readline()
+            if output == '' and process.poll() is not None:
+                break
+            if output:
+                output_lines.append(output.strip())
+                # Yield the accumulated output
+                yield "\n".join(output_lines[-50:])  # Show last 50 lines
+        
+        rc = process.poll()
+        if rc == 0:
+            output_lines.append("\n✅ Training completed successfully!")
+        else:
+            output_lines.append(f"\n❌ Training failed with exit code: {rc}")
+        
+        yield "\n".join(output_lines[-50:])
+        
+    except Exception as e:
+        error_msg = f"\n❌ Error running training: {str(e)}"
+        yield error_msg
 
     # Generate Readme
     config = toml.loads(train_config)
@@ -631,16 +1197,19 @@ def start_training(
     with open(sample_prompts_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
     sample_prompts = [line.strip() for line in lines if len(line.strip()) > 0 and line[0] != "#"]
-    md = readme(base_model, lora_name, concept_sentence, sample_prompts)
+    md = readme(unet_file, lora_name, concept_sentence, sample_prompts)
     readme_path = resolve_path_without_quotes(f"outputs/{output_name}/README.md")
     with open(readme_path, "w", encoding="utf-8") as f:
         f.write(md)
 
-    gr.Info(f"Training Complete. Check the outputs folder for the LoRA files.", duration=None)
+    gr.Info(f"Training Complete. Check the outputs folder for the LoRA files.")
 
 
 def update(
-    base_model,
+    unet_file,
+    clip_file,
+    t5_file,
+    vae_file,
     lora_name,
     resolution,
     seed,
@@ -656,12 +1225,26 @@ def update(
     num_repeats,
     sample_prompts,
     sample_every_n_steps,
+    lr_scheduler,
+    max_train_steps,
+    train_batch_size,
+    reg_data_dir,
+    cache_latents,
+    cache_latents_to_disk,
+    cache_text_encoder_outputs,
+    cache_text_encoder_outputs_to_disk,
+    skip_cache_check,
+    vae_batch_size,
+    cache_info,
     *advanced_components,
 ):
     output_name = slugify(lora_name)
     dataset_folder = str(f"datasets/{output_name}")
     sh = gen_sh(
-        base_model,
+        unet_file,
+        clip_file,
+        t5_file,
+        vae_file,
         output_name,
         resolution,
         seed,
@@ -675,6 +1258,17 @@ def update(
         vram,
         sample_prompts,
         sample_every_n_steps,
+        lr_scheduler,
+        max_train_steps,
+        train_batch_size,
+        reg_data_dir,
+        cache_latents,
+        cache_latents_to_disk,
+        cache_text_encoder_outputs,
+        cache_text_encoder_outputs_to_disk,
+        skip_cache_check,
+        vae_batch_size,
+        cache_info,
         *advanced_components,
     )
     toml = gen_toml(
@@ -705,100 +1299,51 @@ def refresh_publish_tab():
     return gr.Dropdown(label="Trained LoRAs", choices=loras)
 
 def init_advanced():
-    # if basic_args
-    basic_args = {
-        'pretrained_model_name_or_path',
-        'clip_l',
-        't5xxl',
-        'ae',
-        'cache_latents_to_disk',
-        'save_model_as',
-        'sdpa',
-        'persistent_data_loader_workers',
-        'max_data_loader_n_workers',
-        'seed',
-        'gradient_checkpointing',
-        'mixed_precision',
-        'save_precision',
-        'network_module',
-        'network_dim',
-        'learning_rate',
-        'cache_text_encoder_outputs',
-        'cache_text_encoder_outputs_to_disk',
-        'fp8_base',
-        'highvram',
-        'max_train_epochs',
-        'save_every_n_epochs',
-        'dataset_config',
-        'output_dir',
-        'output_name',
-        'timestep_sampling',
-        'discrete_flow_shift',
-        'model_prediction_type',
-        'guidance_scale',
-        'loss_type',
-        'optimizer_type',
-        'optimizer_args',
-        'lr_scheduler',
-        'sample_prompts',
-        'sample_every_n_steps',
-        'max_grad_norm',
-        'split_mode',
-        'network_args'
-    }
-
-    # generate a UI config
-    # if not in basic_args, create a simple form
-    parser = train_network.setup_parser()
-    flux_train_utils.add_flux_train_arguments(parser)
-    args_info = {}
-    for action in parser._actions:
-        if action.dest != 'help':  # Skip the default help argument
-            # if the dest is included in basic_args
-            args_info[action.dest] = {
-                "action": action.option_strings,  # Option strings like '--use_8bit_adam'
-                "type": action.type,              # Type of the argument
-                "help": action.help,              # Help message
-                "default": action.default,        # Default value, if any
-                "required": action.required       # Whether the argument is required
-            }
-    temp = []
-    for key in args_info:
-        temp.append({ 'key': key, 'action': args_info[key] })
-    temp.sort(key=lambda x: x['key'])
-    advanced_component_ids = []
+    """Initialize advanced components with safe, static configuration"""
+    # Create a simplified set of advanced components to avoid dynamic parsing issues
     advanced_components = []
-    for item in temp:
-        key = item['key']
-        action = item['action']
-        if key in basic_args:
-            print("")
-        else:
-            action_type = str(action['type'])
-            component = None
-            with gr.Column(min_width=300):
-                if action_type == "None":
-                    # radio
-                    component = gr.Checkbox()
-    #            elif action_type == "<class 'str'>":
-    #                component = gr.Textbox()
-    #            elif action_type == "<class 'int'>":
-    #                component = gr.Number(precision=0)
-    #            elif action_type == "<class 'float'>":
-    #                component = gr.Number()
-    #            elif "int_or_float" in action_type:
-    #                component = gr.Number()
-                else:
-                    component = gr.Textbox(value="")
-                if component != None:
-                    component.interactive = True
-                    component.elem_id = action['action'][0]
-                    component.label = component.elem_id
-                    component.elem_classes = ["advanced"]
-                if action['help'] != None:
-                    component.info = action['help']
+    advanced_component_ids = []
+    
+    # Define commonly used advanced training options manually
+    advanced_options = [
+        {"id": "--use_8bit_adam", "label": "Use 8-bit Adam", "type": "checkbox", "help": "Use 8-bit Adam optimizer"},
+        {"id": "--xformers", "label": "Use Xformers", "type": "checkbox", "help": "Use xformers for memory efficiency"},
+        {"id": "--gradient_accumulation_steps", "label": "Gradient Accumulation Steps", "type": "number", "help": "Number of steps to accumulate gradients"},
+        {"id": "--clip_skip", "label": "CLIP Skip", "type": "number", "help": "Number of CLIP layers to skip"},
+        {"id": "--noise_offset", "label": "Noise Offset", "type": "number", "help": "Noise offset for training"},
+        {"id": "--adaptive_noise_scale", "label": "Adaptive Noise Scale", "type": "number", "help": "Adaptive noise scale"},
+        {"id": "--multires_noise_iterations", "label": "Multires Noise Iterations", "type": "number", "help": "Multi-resolution noise iterations"},
+        {"id": "--multires_noise_discount", "label": "Multires Noise Discount", "type": "number", "help": "Multi-resolution noise discount"},
+    ]
+    
+    for option in advanced_options:
+        with gr.Column(min_width=300):
+            if option["type"] == "checkbox":
+                component = gr.Checkbox(
+                    label=option["label"],
+                    value=False,
+                    info=option.get("help", ""),
+                    elem_classes=["advanced"]
+                )
+            elif option["type"] == "number":
+                component = gr.Number(
+                    label=option["label"],
+                    value=0,
+                    info=option.get("help", ""),
+                    elem_classes=["advanced"]
+                )
+            else:
+                component = gr.Textbox(
+                    label=option["label"],
+                    value="",
+                    info=option.get("help", ""),
+                    elem_classes=["advanced"]
+                )
+            
+            component.elem_id = option["id"]
             advanced_components.append(component)
-            advanced_component_ids.append(component.elem_id)
+            advanced_component_ids.append(option["id"])
+    
     return advanced_components, advanced_component_ids
 
 
@@ -890,7 +1435,7 @@ function() {
 current_account = account_hf()
 print(f"current_account={current_account}")
 
-with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
+with gr.Blocks(elem_id="app", theme=theme, css=css) as demo:
     with gr.Tabs() as tabs:
         with gr.TabItem("Gym"):
             output_components = []
@@ -907,6 +1452,13 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                         """# Step 1. LoRA Info
         <p style="margin-top:0">Configure your LoRA train settings.</p>
         """, elem_classes="group_padding")
+                    
+                    # GPU Detection and Auto-Configuration
+                    with gr.Group():
+                        gr.Markdown("**🎮 GPU Detection & Auto-Configuration**")
+                        gpu_info_display = gr.Markdown("Detecting GPU...")
+                        auto_config_btn = gr.Button("🔧 Auto-Configure Optimal Settings", variant="secondary")
+                    
                     lora_name = gr.Textbox(
                         label="The name of your LoRA",
                         info="This has to be a unique name",
@@ -919,16 +1471,53 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                         placeholder="uncommon word like p3rs0n or trtcrd, or sentence like 'in the style of CNSTLL'",
                         interactive=True,
                     )
-                    model_names = list(models.keys())
-                    print(f"model_names={model_names}")
-                    base_model = gr.Dropdown(label="Base model (edit the models.yaml file to add more to this list)", choices=model_names, value=model_names[0])
-                    vram = gr.Radio(["20G", "16G", "12G" ], value="20G", label="VRAM", interactive=True)
-                    num_repeats = gr.Number(value=10, precision=0, label="Repeat trains per image", interactive=True)
-                    max_train_epochs = gr.Number(label="Max Train Epochs", value=16, interactive=True)
+                    
+                    # Get available model files
+                    available_models = get_available_models()
+                    
+                    # Model selection dropdowns
+                    with gr.Group():
+                        gr.Markdown("**Model Selection** - Select files from your local models/ directory")
+                        with gr.Row():
+                            refresh_models_btn = gr.Button("🔄 Refresh Models", size="sm")
+                        with gr.Row():
+                            with gr.Column():
+                                unet_file = gr.Dropdown(
+                                    label="UNET Model", 
+                                    choices=available_models['unet'], 
+                                    value=available_models['unet'][0] if available_models['unet'] else None,
+                                    info="Main model file (.safetensors or .sft)"
+                                )
+                            with gr.Column():
+                                vae_file = gr.Dropdown(
+                                    label="VAE Model", 
+                                    choices=available_models['vae'], 
+                                    value=available_models['vae'][0] if available_models['vae'] else None,
+                                    info="VAE encoder/decoder"
+                                )
+                        with gr.Row():
+                            with gr.Column():
+                                clip_file = gr.Dropdown(
+                                    label="CLIP Model", 
+                                    choices=available_models['clip'], 
+                                    value=available_models['clip'][0] if available_models['clip'] else None,
+                                    info="CLIP text encoder"
+                                )
+                            with gr.Column():
+                                t5_file = gr.Dropdown(
+                                    label="T5 Model", 
+                                    choices=available_models['t5'], 
+                                    value=available_models['t5'][0] if available_models['t5'] else None,
+                                    info="T5 text encoder"
+                                )
+                    
+                    vram = gr.Radio(["20G", "16G", "12G" ], value="20G", label="VRAM", info="GPU memory optimization setting (auto-detected)", interactive=True)
+                    num_repeats = gr.Number(value=10, precision=0, label="Repeat trains per image", info="Higher values = more training on each image", interactive=True)
+                    max_train_epochs = gr.Number(label="Max Train Epochs", value=16, info="Total training epochs (auto-optimized)", interactive=True)
                     total_steps = gr.Number(0, interactive=False, label="Expected training steps")
                     sample_prompts = gr.Textbox("", lines=5, label="Sample Image Prompts (Separate with new lines)", interactive=True)
                     sample_every_n_steps = gr.Number(0, precision=0, label="Sample Image Every N Steps", interactive=True)
-                    resolution = gr.Number(value=512, precision=0, label="Resize dataset images")
+                    resolution = gr.Number(value=512, precision=0, label="Resize dataset images", info="Training resolution (auto-optimized for GPU)", interactive=True)
                 with gr.Column():
                     gr.Markdown(
                         """# Step 2. Dataset
@@ -945,9 +1534,33 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                             scale=1,
                         )
                     with gr.Group(visible=False) as captioning_area:
-                        do_captioning = gr.Button("Add AI captions with Florence-2")
+                        with gr.Row():
+                            captioning_method = gr.Radio(
+                                choices=["Florence-2", "Ollama"], 
+                                value="Florence-2", 
+                                label="Captioning Method",
+                                info="Choose between Florence-2 (local) or Ollama (requires Ollama server)"
+                            )
+                        
+                        with gr.Row():
+                            with gr.Column():
+                                do_captioning = gr.Button("Add AI captions", variant="primary")
+                            with gr.Column(visible=False) as ollama_settings:
+                                ollama_url = gr.Textbox(
+                                    value="http://localhost:11434",
+                                    label="Ollama URL",
+                                    info="Ollama server URL"
+                                )
+                                ollama_model = gr.Dropdown(
+                                    choices=[],
+                                    label="Ollama Vision Model",
+                                    info="Select a vision-capable model (auto-loaded from Ollama)"
+                                )
+                                refresh_ollama = gr.Button("🔄 Refresh Models", size="sm")
+                        
                         output_components.append(captioning_area)
-                        #output_components = [captioning_area]
+                        output_components.append(ollama_settings)
+                        output_components.append(ollama_model)  # Add ollama_model to output components
                         caption_list = []
                         for i in range(1, MAX_IMAGES + 1):
                             locals()[f"captioning_row_{i}"] = gr.Row(visible=False)
@@ -982,13 +1595,20 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                     train_script = gr.Textbox(label="Train script", max_lines=100, interactive=True)
                     train_config = gr.Textbox(label="Train config", max_lines=100, interactive=True)
             with gr.Accordion("Advanced options", elem_id='advanced_options', open=False):
+                gr.Markdown("""
+                **💡 Auto-Configuration Info:**
+                - Settings are automatically optimized based on your GPU and VRAM
+                - Higher VRAM allows larger batch sizes, higher resolution, and better quality
+                - Network Dim (LoRA Rank) affects model complexity vs. training speed
+                - Learning rate is adjusted for optimal convergence
+                """)
                 with gr.Row():
                     with gr.Column(min_width=300):
                         seed = gr.Number(label="--seed", info="Seed", value=42, interactive=True)
                     with gr.Column(min_width=300):
-                        workers = gr.Number(label="--max_data_loader_n_workers", info="Number of Workers", value=2, interactive=True)
+                        workers = gr.Number(label="--max_data_loader_n_workers", info="Number of Workers (auto-optimized)", value=2, interactive=True)
                     with gr.Column(min_width=300):
-                        learning_rate = gr.Textbox(label="--learning_rate", info="Learning Rate", value="8e-4", interactive=True)
+                        learning_rate = gr.Textbox(label="--learning_rate", info="Learning Rate (auto-optimized)", value="8e-4", interactive=True)
                     with gr.Column(min_width=300):
                         save_every_n_epochs = gr.Number(label="--save_every_n_epochs", info="Save every N epochs", value=4, interactive=True)
                     with gr.Column(min_width=300):
@@ -996,12 +1616,109 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                     with gr.Column(min_width=300):
                         timestep_sampling = gr.Textbox(label="--timestep_sampling", info="Timestep Sampling", value="shift", interactive=True)
                     with gr.Column(min_width=300):
-                        network_dim = gr.Number(label="--network_dim", info="LoRA Rank", value=4, minimum=4, maximum=128, step=4, interactive=True)
-                    advanced_components, advanced_component_ids = init_advanced()
+                        network_dim = gr.Number(label="--network_dim", info="LoRA Rank (auto-optimized for GPU)", value=4, minimum=4, maximum=128, step=4, interactive=True)
+                
+                # New advanced training parameters
+                with gr.Row():
+                    with gr.Column(min_width=300):
+                        lr_scheduler = gr.Dropdown(
+                            label="--lr_scheduler", 
+                            choices=["constant", "cosine", "cosine_with_restarts", "polynomial", "linear", "constant_with_warmup", "adafactor"],
+                            value="constant",
+                            info="Learning rate scheduler type",
+                            interactive=True
+                        )
+                    with gr.Column(min_width=300):
+                        max_train_steps = gr.Number(
+                            label="--max_train_steps", 
+                            info="Maximum training steps (overrides max_train_epochs)", 
+                            value=None, 
+                            interactive=True
+                        )
+                    with gr.Column(min_width=300):
+                        train_batch_size = gr.Number(
+                            label="--train_batch_size", 
+                            info="Batch size for training", 
+                            value=1, 
+                            minimum=1, 
+                            interactive=True
+                        )
+                    with gr.Column(min_width=300):
+                        reg_data_dir = gr.Textbox(
+                            label="--reg_data_dir", 
+                            info="Directory for regularization/reference images", 
+                            value="", 
+                            interactive=True
+                        )
+                
+                # Caching options for training optimization
+                with gr.Row():
+                    with gr.Column(min_width=300):
+                        cache_latents = gr.Checkbox(
+                            label="--cache_latents", 
+                            info="Cache latents to main memory to reduce VRAM usage", 
+                            value=False, 
+                            interactive=True
+                        )
+                    with gr.Column(min_width=300):
+                        cache_latents_to_disk = gr.Checkbox(
+                            label="--cache_latents_to_disk", 
+                            info="Cache latents to disk to reduce VRAM usage", 
+                            value=False, 
+                            interactive=True
+                        )
+                    with gr.Column(min_width=300):
+                        cache_text_encoder_outputs = gr.Checkbox(
+                            label="--cache_text_encoder_outputs", 
+                            info="Cache text encoder outputs", 
+                            value=False, 
+                            interactive=True
+                        )
+                    with gr.Column(min_width=300):
+                        cache_text_encoder_outputs_to_disk = gr.Checkbox(
+                            label="--cache_text_encoder_outputs_to_disk", 
+                            info="Cache text encoder outputs to disk", 
+                            value=False, 
+                            interactive=True
+                        )
+                
+                with gr.Row():
+                    with gr.Column(min_width=300):
+                        skip_cache_check = gr.Checkbox(
+                            label="--skip_cache_check", 
+                            info="Skip content validation of cache", 
+                            value=False, 
+                            interactive=True
+                        )
+                    with gr.Column(min_width=300):
+                        vae_batch_size = gr.Number(
+                            label="--vae_batch_size", 
+                            info="Batch size for caching latents", 
+                            value=1, 
+                            minimum=1, 
+                            interactive=True
+                        )
+                    with gr.Column(min_width=300):
+                        cache_info = gr.Checkbox(
+                            label="--cache_info", 
+                            info="Cache meta information for faster dataset loading (DreamBooth)", 
+                            value=False, 
+                            interactive=True
+                        )
+                
+                advanced_components, advanced_component_ids = init_advanced()
             with gr.Row():
-                terminal = LogsView(label="Train log", elem_id="terminal")
+                terminal = gr.Textbox(
+                    label="Training Log", 
+                    elem_id="terminal",
+                    lines=20,
+                    max_lines=50,
+                    interactive=False,
+                    show_copy_button=True,
+                    container=True
+                )
             with gr.Row():
-                gallery = gr.Gallery(get_samples, inputs=[lora_name], label="Samples", every=10, columns=6)
+                gallery = gr.Gallery(label="Samples", columns=6)
 
         with gr.TabItem("Publish") as publish_tab:
             hf_token = gr.Textbox(label="Huggingface Token")
@@ -1022,7 +1739,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                     upload_button.click(
                         fn=upload_hf,
                         inputs=[
-                            base_model,
+                            unet_file,
                             lora_rows,
                             repo_owner,
                             repo_name,
@@ -1040,7 +1757,10 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
     dataset_folder = gr.State()
 
     listeners = [
-        base_model,
+        unet_file,
+        clip_file,
+        t5_file,
+        vae_file,
         lora_name,
         resolution,
         seed,
@@ -1056,16 +1776,22 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         num_repeats,
         sample_prompts,
         sample_every_n_steps,
+        lr_scheduler,
+        max_train_steps,
+        train_batch_size,
+        reg_data_dir,
+        cache_latents,
+        cache_latents_to_disk,
+        cache_text_encoder_outputs,
+        cache_text_encoder_outputs_to_disk,
+        skip_cache_check,
+        vae_batch_size,
+        cache_info,
         *advanced_components
     ]
     advanced_component_ids = [x.elem_id for x in advanced_components]
     original_advanced_component_values = [comp.value for comp in advanced_components]
     images.upload(
-        load_captioning,
-        inputs=[images, concept_sentence],
-        outputs=output_components
-    )
-    images.delete(
         load_captioning,
         inputs=[images, concept_sentence],
         outputs=output_components
@@ -1089,21 +1815,34 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         inputs=[max_train_epochs, num_repeats, images],
         outputs=[total_steps]
     )
-    images.delete(
-        fn=update_total_steps,
-        inputs=[max_train_epochs, num_repeats, images],
-        outputs=[total_steps]
-    )
     images.clear(
         fn=update_total_steps,
         inputs=[max_train_epochs, num_repeats, images],
         outputs=[total_steps]
     )
     concept_sentence.change(fn=update_sample, inputs=[concept_sentence], outputs=sample_prompts)
+    
+    # Captioning method toggle
+    captioning_method.change(
+        fn=toggle_captioning_method,
+        inputs=[captioning_method], 
+        outputs=[ollama_settings, ollama_model]
+    )
+    
+    # Ollama model refresh
+    refresh_ollama.click(
+        fn=refresh_ollama_models,
+        inputs=[ollama_url],
+        outputs=[ollama_model]
+    )
+    
     start.click(fn=create_dataset, inputs=[dataset_folder, resolution, images] + caption_list, outputs=dataset_folder).then(
         fn=start_training,
         inputs=[
-            base_model,
+            unet_file,
+            clip_file,
+            t5_file,
+            vae_file,
             lora_name,
             train_script,
             train_config,
@@ -1111,9 +1850,66 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         ],
         outputs=terminal,
     )
-    do_captioning.click(fn=run_captioning, inputs=[images, concept_sentence] + caption_list, outputs=caption_list)
+    do_captioning.click(
+        fn=run_captioning, 
+        inputs=[images, concept_sentence, captioning_method, ollama_model, ollama_url] + caption_list, 
+        outputs=caption_list
+    )
     demo.load(fn=loaded, js=js, outputs=[hf_token, hf_login, hf_logout, repo_owner])
+    
+    # Auto-configure settings on load and when button is clicked
+    demo.load(
+        fn=auto_configure_settings,
+        outputs=[gpu_info_display, vram, resolution, network_dim, learning_rate, max_train_epochs, save_every_n_epochs, workers]
+    )
+    auto_config_btn.click(
+        fn=auto_configure_settings,
+        outputs=[gpu_info_display, vram, resolution, network_dim, learning_rate, max_train_epochs, save_every_n_epochs, workers]
+    )
+    
     refresh.click(update, inputs=listeners, outputs=[train_script, train_config, dataset_folder])
+    refresh_models_btn.click(refresh_models, outputs=[unet_file, vae_file, clip_file, t5_file])
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='FluxGym - FLUX LoRA Training Application')
+    parser.add_argument('--listen', '--host', type=str, default='127.0.0.1', 
+                       help='Host to bind the server to (default: 127.0.0.1, use 0.0.0.0 for all interfaces)')
+    parser.add_argument('--port', type=int, default=7860, 
+                       help='Port to run the server on (default: 7860)')
+    parser.add_argument('--share', action='store_true', 
+                       help='Create a public Gradio link')
+    parser.add_argument('--auth', type=str, 
+                       help='Authentication in format "username:password"')
+    parser.add_argument('--debug', action='store_true', 
+                       help='Enable debug mode')
+    
+    args = parser.parse_args()
+    
+    # Parse authentication if provided
+    auth = None
+    if args.auth:
+        try:
+            username, password = args.auth.split(':')
+            auth = (username, password)
+        except ValueError:
+            print("Error: Auth format should be 'username:password'")
+            exit(1)
+    
     cwd = os.path.dirname(os.path.abspath(__file__))
-    demo.launch(debug=True, show_error=True, allowed_paths=[cwd])
+    
+    print(f"🚀 Starting FluxGym on {args.listen}:{args.port}")
+    if args.share:
+        print("🌐 Creating public share link...")
+    if auth:
+        print(f"🔐 Authentication enabled for user: {auth[0]}")
+    
+    demo.launch(
+        server_name=args.listen,
+        server_port=args.port,
+        share=args.share,
+        auth=auth,
+        debug=args.debug,
+        show_error=True,
+        allowed_paths=[cwd]
+    )

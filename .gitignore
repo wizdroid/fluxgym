@@ -1,0 +1,189 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# FluxGym specific
+# Model files (these are large binary files) - EXCLUDE ALL .safetensors
+models/**/*.safetensors
+models/**/*.sft
+models/**/*.pt
+models/**/*.pth
+models/**/*.ckpt
+models/**/*.bin
+*.safetensors
+*.sft
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# Keep directory structure but ignore model files
+!models/clip/.gitkeep
+!models/unet/.gitkeep
+!models/vae/.gitkeep
+
+# Training outputs
+outputs/
+*.log
+*.out
+
+# Dataset files
+datasets/
+data/
+
+# Temporary files
+temp/
+tmp/
+*.tmp
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Test artifacts and generated content
+.pytest_cache/
+test-output/
+tests/assets/test_images/
+tests/assets/sample_images/
+tests/assets/custom_images/
+**/test_images/
+**/sample_images/
+
+# Temporary test files (but keep actual test suite)
+test_*.py.tmp
+*_test_*.png
+*_test_*.jpg
+*_test_*.jpeg
+test_app_functionality.py
+test_florence_fix.py
+
+# HuggingFace cache
+.cache/
+transformers_cache/
+huggingface_cache/
+
+# Weights & Biases
+wandb/
+
+# TensorBoard logs
+logs/
+runs/
+
+# Environment and config files that might contain secrets
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+config.local.yaml
+config.local.json
+
+# API keys and tokens
+HF_TOKEN
+*.token
+*.key
+
+# Large training files
+*.h5
+*.hdf5
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Compressed files
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# Images (if you want to exclude training images)
+# Uncomment the following lines if you don't want to track training images
+# *.jpg
+# *.jpeg
+# *.png
+# *.gif
+# *.bmp
+# *.tiff
+# *.webp
+
+# Videos
+*.mp4
+*.avi
+*.mov
+*.wmv
+*.flv
+*.webm
+
+# Audio files
+*.mp3
+*.wav
+*.flac
+*.ogg
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Lock files
+poetry.lock
+Pipfile.lock
+
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
