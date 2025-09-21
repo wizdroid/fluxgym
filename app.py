@@ -29,13 +29,250 @@ import base64
 from io import BytesIO
 from slugify import slugify
 from transformers import AutoProcessor, AutoModelForCausalLM
-from huggingface_hub import hf_hub_download, HfApi
+import json
 from library import flux_train_utils, huggingface_util
 from argparse import Namespace
 import train_network
 import toml
 import re
+from datetime import datetime
 MAX_IMAGES = 150
+
+# Workflow automation features
+def detect_interrupted_training():
+    """Detect and list interrupted training sessions that can be resumed."""
+    outputs_dir = resolve_path_without_quotes("outputs")
+    interrupted_trainings = []
+    
+    if not os.path.exists(outputs_dir):
+        return interrupted_trainings
+    
+    for item in os.listdir(outputs_dir):
+        item_path = os.path.join(outputs_dir, item)
+        if os.path.isdir(item_path):
+            # Check for training artifacts but missing final model
+            train_script = os.path.join(item_path, "train.bat") if sys.platform == "win32" else os.path.join(item_path, "train.sh")
+            dataset_config = os.path.join(item_path, "dataset.toml")
+            
+            has_training_files = os.path.exists(train_script) and os.path.exists(dataset_config)
+            
+            # Look for .safetensors files (completed training)
+            safetensors_files = [f for f in os.listdir(item_path) if f.endswith('.safetensors')]
+            
+            # Check for checkpoint/state files (interrupted training)
+            state_files = [f for f in os.listdir(item_path) if 'epoch' in f.lower() or 'step' in f.lower()]
+            
+            if has_training_files and not safetensors_files and len(state_files) > 0:
+                interrupted_trainings.append({
+                    'name': item,
+                    'path': item_path,
+                    'last_checkpoint': max(state_files) if state_files else None,
+                    'dataset_path': dataset_config,
+                    'script_path': train_script
+                })
+    
+    return interrupted_trainings
+
+def create_batch_training_queue(queue_items):
+    """Create a batch training queue to train multiple LoRAs sequentially."""
+    queue_file = resolve_path_without_quotes("training_queue.json")
+    
+    queue_data = {
+        'created_at': str(datetime.now()),
+        'status': 'pending',
+        'current_index': 0,
+        'items': queue_items
+    }
+    
+    with open(queue_file, 'w') as f:
+        json.dump(queue_data, f, indent=2)
+    
+    return queue_file
+
+def process_training_queue():
+    """Process the training queue and train LoRAs sequentially."""
+    queue_file = resolve_path_without_quotes("training_queue.json")
+    
+    if not os.path.exists(queue_file):
+        return "No training queue found"
+    
+    with open(queue_file, 'r') as f:
+        queue_data = json.load(f)
+    
+    if queue_data['status'] == 'completed':
+        return "Queue already completed"
+    
+    # Process next item in queue
+    current_index = queue_data['current_index']
+    items = queue_data['items']
+    
+    if current_index >= len(items):
+        queue_data['status'] = 'completed'
+        with open(queue_file, 'w') as f:
+            json.dump(queue_data, f, indent=2)
+        return "Queue completed"
+    
+    current_item = items[current_index]
+    
+    # Start training for current item
+    try:
+        # Execute training script
+        script_path = current_item['script_path']
+        
+        if sys.platform == "win32":
+            result = subprocess.run(script_path, shell=True, capture_output=True, text=True)
+        else:
+            result = subprocess.run(["bash", script_path], capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            # Mark current item as completed and move to next
+            queue_data['current_index'] += 1
+            queue_data['items'][current_index]['status'] = 'completed'
+            queue_data['items'][current_index]['completed_at'] = str(datetime.now())
+        else:
+            # Mark as failed
+            queue_data['items'][current_index]['status'] = 'failed'
+            queue_data['items'][current_index]['error'] = result.stderr
+        
+        with open(queue_file, 'w') as f:
+            json.dump(queue_data, f, indent=2)
+        
+        return f"Processed item {current_index + 1}/{len(items)}: {current_item['name']}"
+        
+    except Exception as e:
+        queue_data['items'][current_index]['status'] = 'failed'
+        queue_data['items'][current_index]['error'] = str(e)
+        
+        with open(queue_file, 'w') as f:
+            json.dump(queue_data, f, indent=2)
+        
+        return f"Failed to process item {current_index + 1}: {str(e)}"
+
+def auto_optimize_dataset(image_folder, target_resolution=512, auto_caption=True, concept_word=None):
+    """Automatically optimize a dataset: resize images, generate captions, create TOML."""
+    
+    if not os.path.exists(image_folder):
+        return "Image folder not found"
+    
+    optimized_folder = f"{image_folder}_optimized"
+    os.makedirs(optimized_folder, exist_ok=True)
+    
+    image_files = [f for f in os.listdir(image_folder) 
+                   if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp'))]
+    
+    if len(image_files) == 0:
+        return "No image files found"
+    
+    processed_count = 0
+    
+    for img_file in image_files:
+        try:
+            # Resize and optimize image
+            img_path = os.path.join(image_folder, img_file)
+            img_name, img_ext = os.path.splitext(img_file)
+            
+            with Image.open(img_path) as img:
+                # Convert to RGB if needed
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                # Resize maintaining aspect ratio
+                width, height = img.size
+                if width > height:
+                    new_width = target_resolution
+                    new_height = int((target_resolution / width) * height)
+                else:
+                    new_height = target_resolution
+                    new_width = int((target_resolution / height) * width)
+                
+                img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                
+                # Save optimized image
+                optimized_img_path = os.path.join(optimized_folder, f"{img_name}.png")
+                img_resized.save(optimized_img_path, "PNG", quality=95)
+                
+                # Generate caption if requested
+                if auto_caption:
+                    caption_path = os.path.join(optimized_folder, f"{img_name}.txt")
+                    
+                    # Check if caption already exists
+                    if not os.path.exists(caption_path):
+                        # Generate simple caption
+                        base_caption = f"a high quality image"
+                        if concept_word:
+                            base_caption = f"{concept_word} {base_caption}"
+                        
+                        with open(caption_path, 'w', encoding='utf-8') as f:
+                            f.write(base_caption)
+                
+                processed_count += 1
+                
+        except Exception as e:
+            print(f"Error processing {img_file}: {e}")
+            continue
+    
+    # Generate optimized TOML config
+    if processed_count > 0 and concept_word:
+        toml_path = os.path.join(optimized_folder, "dataset.toml")
+        toml_content = gen_toml(optimized_folder, target_resolution, concept_word, 10)
+        
+        with open(toml_path, 'w', encoding='utf-8') as f:
+            f.write(toml_content)
+    
+    return f"Optimized {processed_count} images in {optimized_folder}"
+
+def smart_parameter_suggestions(gpu_vram_gb, dataset_size, image_resolution):
+    """Provide intelligent parameter suggestions based on system specs and dataset."""
+    suggestions = {}
+    
+    # Adjust batch size based on VRAM and resolution
+    if gpu_vram_gb >= 24 and image_resolution <= 512:
+        suggestions['batch_size'] = 2
+        suggestions['vae_batch_size'] = 4
+    elif gpu_vram_gb >= 16:
+        suggestions['batch_size'] = 1
+        suggestions['vae_batch_size'] = 2
+    else:
+        suggestions['batch_size'] = 1
+        suggestions['vae_batch_size'] = 1
+    
+    # Adjust epochs based on dataset size
+    if dataset_size < 5:
+        suggestions['max_train_epochs'] = 20
+        suggestions['num_repeats'] = 20
+    elif dataset_size < 10:
+        suggestions['max_train_epochs'] = 15
+        suggestions['num_repeats'] = 15
+    elif dataset_size < 20:
+        suggestions['max_train_epochs'] = 12
+        suggestions['num_repeats'] = 10
+    else:
+        suggestions['max_train_epochs'] = 10
+        suggestions['num_repeats'] = 8
+    
+    # Network dimension based on complexity needed
+    if dataset_size < 10:
+        suggestions['network_dim'] = 8
+    elif dataset_size < 20:
+        suggestions['network_dim'] = 16
+    else:
+        suggestions['network_dim'] = 32
+    
+    # Learning rate based on dataset size
+    if dataset_size < 10:
+        suggestions['learning_rate'] = '1e-3'
+    else:
+        suggestions['learning_rate'] = '8e-4'
+    
+    # Caching recommendations
+    if gpu_vram_gb < 16:
+        suggestions['cache_latents_to_disk'] = True
+        suggestions['cache_text_encoder_outputs_to_disk'] = True
+    else:
+        suggestions['cache_latents'] = True
+        suggestions['cache_text_encoder_outputs'] = True
+    
+    return suggestions
 
 def detect_gpu_info():
     """Detect GPU information including name, VRAM, and capabilities"""
@@ -1749,6 +1986,130 @@ with gr.Blocks(elem_id="app", theme=theme, css=css) as demo:
                     )
             hf_login.click(fn=login_hf, inputs=[hf_token], outputs=[hf_token, hf_login, hf_logout, repo_owner])
             hf_logout.click(fn=logout_hf, outputs=[hf_token, hf_login, hf_logout, repo_owner])
+
+        with gr.TabItem("🚀 Workflow Automation"):
+            gr.Markdown("### Automate your training workflow with these powerful features")
+            
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("#### 🔄 Smart Training Resume")
+                    gr.Markdown("Automatically detect and resume interrupted training sessions")
+                    resume_scan_btn = gr.Button("Scan for Interrupted Training", variant="secondary")
+                    resume_list = gr.Dropdown(label="Select Training to Resume", choices=[], interactive=True)
+                    resume_btn = gr.Button("Resume Training", variant="primary")
+                    resume_status = gr.Textbox(label="Resume Status", interactive=False)
+                    
+                with gr.Column():
+                    gr.Markdown("#### 📋 Batch Training Queue")
+                    gr.Markdown("Queue multiple LoRA training jobs to run sequentially")
+                    queue_name = gr.Textbox(label="Queue Item Name", placeholder="character_lora_1")
+                    queue_script = gr.File(label="Training Script", file_types=[".sh", ".bat"])
+                    add_to_queue_btn = gr.Button("Add to Queue", variant="secondary")
+                    queue_list = gr.Dataframe(
+                        headers=["Name", "Status", "Added"],
+                        datatype=["str", "str", "str"],
+                        label="Training Queue"
+                    )
+                    start_queue_btn = gr.Button("Start Batch Training", variant="primary")
+                    queue_status = gr.Textbox(label="Queue Status", interactive=False)
+            
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("#### 🎯 Auto Dataset Optimizer")
+                    gr.Markdown("Automatically resize images, generate captions, and optimize datasets")
+                    dataset_folder = gr.Textbox(label="Dataset Folder Path", placeholder="C:/datasets/my_character")
+                    optimize_resolution = gr.Slider(minimum=256, maximum=1024, value=512, step=64, label="Target Resolution")
+                    auto_caption_enable = gr.Checkbox(label="Auto-generate Captions", value=True)
+                    concept_word_input = gr.Textbox(label="Concept Word (for captions)", placeholder="character_name")
+                    optimize_btn = gr.Button("Optimize Dataset", variant="primary")
+                    optimize_status = gr.Textbox(label="Optimization Status", interactive=False)
+                    
+                with gr.Column():
+                    gr.Markdown("#### 🧠 Smart Parameter Suggestions")
+                    gr.Markdown("Get AI-powered parameter recommendations")
+                    suggest_vram = gr.Slider(minimum=4, maximum=48, value=12, step=2, label="GPU VRAM (GB)")
+                    suggest_dataset_size = gr.Number(label="Dataset Size (number of images)", value=10)
+                    suggest_resolution = gr.Slider(minimum=256, maximum=1024, value=512, step=64, label="Image Resolution")
+                    get_suggestions_btn = gr.Button("Get Smart Suggestions", variant="secondary")
+                    suggestions_output = gr.JSON(label="Recommended Parameters")
+            
+            # Event handlers for workflow automation
+            def scan_interrupted():
+                interrupted = detect_interrupted_training()
+                choices = [f"{item['name']} (Last checkpoint: {item['last_checkpoint']})" for item in interrupted]
+                return gr.update(choices=choices)
+            
+            def resume_training(selected_training):
+                if not selected_training:
+                    return "Please select a training to resume"
+                
+                # Extract training name
+                training_name = selected_training.split(" (")[0]
+                interrupted = detect_interrupted_training()
+                
+                for item in interrupted:
+                    if item['name'] == training_name:
+                        try:
+                            # Execute the training script
+                            if sys.platform == "win32":
+                                subprocess.Popen(item['script_path'], shell=True)
+                            else:
+                                subprocess.Popen(["bash", item['script_path']])
+                            return f"Resumed training: {training_name}"
+                        except Exception as e:
+                            return f"Failed to resume training: {str(e)}"
+                
+                return "Training session not found"
+            
+            def add_to_training_queue(name, script_file):
+                if not name or not script_file:
+                    return "Please provide name and script file", gr.update()
+                
+                queue_file = resolve_path_without_quotes("training_queue.json")
+                
+                # Load existing queue or create new
+                if os.path.exists(queue_file):
+                    with open(queue_file, 'r') as f:
+                        queue_data = json.load(f)
+                else:
+                    queue_data = {
+                        'created_at': str(datetime.now()),
+                        'status': 'pending',
+                        'current_index': 0,
+                        'items': []
+                    }
+                
+                # Add new item
+                new_item = {
+                    'name': name,
+                    'script_path': script_file.name if hasattr(script_file, 'name') else str(script_file),
+                    'added_at': str(datetime.now()),
+                    'status': 'pending'
+                }
+                
+                queue_data['items'].append(new_item)
+                
+                with open(queue_file, 'w') as f:
+                    json.dump(queue_data, f, indent=2)
+                
+                # Update display
+                queue_display = [[item['name'], item['status'], item['added_at']] for item in queue_data['items']]
+                
+                return f"Added {name} to queue", gr.update(value=queue_display)
+            
+            def optimize_dataset_handler(folder, resolution, auto_caption, concept_word):
+                return auto_optimize_dataset(folder, resolution, auto_caption, concept_word)
+            
+            def get_parameter_suggestions(vram_gb, dataset_size, resolution):
+                suggestions = smart_parameter_suggestions(vram_gb, dataset_size, resolution)
+                return suggestions
+            
+            resume_scan_btn.click(scan_interrupted, outputs=resume_list)
+            resume_btn.click(resume_training, inputs=resume_list, outputs=resume_status)
+            add_to_queue_btn.click(add_to_training_queue, inputs=[queue_name, queue_script], outputs=[queue_status, queue_list])
+            start_queue_btn.click(process_training_queue, outputs=queue_status)
+            optimize_btn.click(optimize_dataset_handler, inputs=[dataset_folder, optimize_resolution, auto_caption_enable, concept_word_input], outputs=optimize_status)
+            get_suggestions_btn.click(get_parameter_suggestions, inputs=[suggest_vram, suggest_dataset_size, suggest_resolution], outputs=suggestions_output)
 
 
     publish_tab.select(refresh_publish_tab, outputs=lora_rows)

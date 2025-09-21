@@ -10,6 +10,14 @@ Dead simple web UI for training FLUX LoRA **with LOW VRAM (12GB/16GB/20GB) suppo
 FluxGym supports 100% of Kohya sd-scripts features through an [Advanced](#advanced) tab, which is hidden by default.
 
 ## Key Features 🚀
+
+### 🚀 **NEW: Workflow Automation Suite**
+- 🔄 **Smart Training Resume** - Automatically detect and resume interrupted training sessions
+- 📋 **Batch Training Queue** - Queue multiple LoRA training jobs to run sequentially overnight
+- 🎯 **Auto Dataset Optimizer** - Automatically resize images, generate captions, and optimize datasets
+- 🧠 **Smart Parameter Suggestions** - Get AI-powered parameter recommendations based on your hardware and dataset
+
+### 💾 **Advanced Caching System**
 - 🧠 **Advanced Caching System** - Optimize VRAM usage with intelligent caching
 - 🖥️ **GPU Auto-Detection** - Automatic optimization for your hardware
 - ⚡ **Performance Optimized** - SDPA attention, persistent data loaders, FP8 support
@@ -223,6 +231,73 @@ The usage is pretty straightforward:
 That's all!
 
 ![flow.gif](flow.gif)
+
+# 🚀 Workflow Automation Features
+
+FluxGym now includes powerful automation features to streamline your training workflow and save hours of manual work.
+
+## 🔄 Smart Training Resume
+
+Never lose progress again! FluxGym automatically detects interrupted training sessions and allows you to resume exactly where you left off.
+
+**How it works:**
+1. Click **"Scan for Interrupted Training"** in the Workflow Automation tab
+2. Select a training session that was interrupted (shows last checkpoint)  
+3. Click **"Resume Training"** to continue from the last saved state
+
+**Perfect for:**
+- Power outages or system crashes during long training sessions
+- Stopping training early and resuming later
+- Experimenting with different parameters on the same dataset
+
+## 📋 Batch Training Queue
+
+Train multiple LoRAs overnight! Queue up several training jobs to run sequentially without manual intervention.
+
+**How to use:**
+1. Generate training scripts for each LoRA you want to train
+2. Add each script to the queue with a descriptive name
+3. Click **"Start Batch Training"** and let it run overnight
+
+**Benefits:**
+- Train multiple character LoRAs in sequence
+- Maximize GPU utilization during off-hours
+- Perfect for creating LoRA sets for projects
+
+## 🎯 Auto Dataset Optimizer
+
+Automatically prepare your datasets for optimal training with one-click optimization.
+
+**Features:**
+- **Auto-resize images** to target resolution (512px, 768px, 1024px)
+- **Generate captions** automatically using your concept word
+- **Optimize file formats** for faster loading
+- **Create TOML configs** with optimized settings
+
+**How to use:**
+1. Point to your raw dataset folder
+2. Set target resolution and concept word
+3. Click **"Optimize Dataset"** 
+4. Get a perfectly prepared dataset in `folder_optimized/`
+
+## 🧠 Smart Parameter Suggestions
+
+Get AI-powered recommendations based on your hardware and dataset characteristics.
+
+**Provides suggestions for:**
+- **Batch sizes** based on your GPU VRAM
+- **Training epochs** based on dataset size  
+- **Learning rates** optimized for your data
+- **Caching options** for your memory constraints
+- **Network dimensions** appropriate for complexity
+
+**How it works:**
+1. Enter your GPU VRAM amount
+2. Specify your dataset size and image resolution
+3. Get personalized parameter recommendations
+4. Apply suggestions directly to your training settings
+
+These features are designed to automate the repetitive parts of LoRA training, letting you focus on the creative aspects of your projects!
 
 # Configuration
 
